@@ -4,66 +4,51 @@ const admin = require("firebase-admin");
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Initialize Firebase Admin SDK
+// ✅ Parse Firebase credentials from environment variable
+const serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+
 admin.initializeApp({
-  credential: admin.credential.applicationDefault(),
+  credential: admin.credential.cert(serviceAccount),
 });
+
+const db = admin.firestore();
 
 app.get("/digest", async (req, res) => {
   const now = new Date();
   const hour = now.getHours();
 
-  let start, end;
-  if (hour >= 15 && hour < 17) {
-    start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0);
-    end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 15, 0);
-  } else if (hour >= 20 && hour < 22) {
-    start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 17, 0);
-    end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 20, 0);
-  } else {
+  if (hour !== 16 && hour !== 21) {
     return res.status(400).send("Invalid trigger time");
   }
 
   try {
-    const snapshot = await admin
-      .firestore()
+    const threeHoursAgo = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+    const jobsSnapshot = await db
       .collection("jobs")
-      .where("postedAt", ">=", admin.firestore.Timestamp.fromDate(start))
-      .where("postedAt", "<=", admin.firestore.Timestamp.fromDate(end))
+      .where("createdAt", ">=", admin.firestore.Timestamp.fromDate(threeHoursAgo))
       .get();
 
-    const jobs = snapshot.docs.map((doc) => {
-      const data = doc.data();
-      return {
-        id: doc.id,
-        ...data,
-        score: (data.views || 0) + (data.applications || 0),
-      };
-    });
-
-    const topJobs = jobs.sort((a, b) => b.score - a.score).slice(0, 3);
-
-    if (topJobs.length === 0) {
-      return res.status(200).send("No trending jobs found");
+    if (jobsSnapshot.empty) {
+      return res.send("No trending jobs found");
     }
 
-    const jobTitles = topJobs
-      .map((job) => `• ${job.title} at ${job.company}`)
-      .join("\n");
+    const trendingJobs = jobsSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
 
-    const payload = {
-      notification: {
-        title: "🔥 Trending Jobs Digest",
-        body: jobTitles,
-      },
+    await admin.messaging().send({
       topic: "trending_jobs",
-    };
+      notification: {
+        title: "🔥 Trending Jobs",
+        body: `${trendingJobs.length} new jobs posted recently. Check them out!`,
+      },
+    });
 
-    await admin.messaging().send(payload);
-    res.status(200).send("Trending jobs notification sent");
+    res.send("Trending jobs notification sent");
   } catch (error) {
     console.error("Error sending digest:", error);
-    res.status(500).send("Internal server error");
+    res.status(500).send("Server error");
   }
 });
 
